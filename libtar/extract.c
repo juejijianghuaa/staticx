@@ -253,7 +253,6 @@ tar_extract_hardlink(TAR * t, const char *realname)
 	return 0;
 }
 
-
 /* symlink */
 int
 tar_extract_symlink(TAR *t, const char *realname)
@@ -273,18 +272,32 @@ tar_extract_symlink(TAR *t, const char *realname)
 	if (unlink(filename) == -1 && errno != ENOENT)
 		return -1;
 
-#ifdef DEBUG
-	printf("  ==> extracting: %s (symlink to %s)\n",
-	       filename, th_get_linkname(t));
-#endif
-	if (symlink(th_get_linkname(t), filename) == -1)
-	{
-#ifdef DEBUG
-		perror("symlink()");
-#endif
+	// 复制 linkname 指向的文件内容到 filename，并打印日志
+	const char *src = th_get_linkname(t);
+	printf("[symlink->copy] copy %s to %s\n", src, filename);
+	FILE *src_fp = fopen(src, "rb");
+	if (!src_fp) {
+		perror("fopen(src)");
 		return -1;
 	}
-
+	FILE *dst_fp = fopen(filename, "wb");
+	if (!dst_fp) {
+		perror("fopen(dst)");
+		fclose(src_fp);
+		return -1;
+	}
+	char buf[4096];
+	size_t n;
+	while ((n = fread(buf, 1, sizeof(buf), src_fp)) > 0) {
+		if (fwrite(buf, 1, n, dst_fp) != n) {
+			perror("fwrite");
+			fclose(src_fp);
+			fclose(dst_fp);
+			return -1;
+		}
+	}
+	fclose(src_fp);
+	fclose(dst_fp);
 	return 0;
 }
 
@@ -461,31 +474,128 @@ tar_extract_all(TAR *t, const char *prefix)
 {
 	const char *filename;
 	char buf[MAXPATHLEN];
+	char src_path[MAXPATHLEN];
 	int i;
+	struct symlink_entry {
+		char target[MAXPATHLEN];
+		char linkname[MAXPATHLEN];
+		mode_t mode;
+		struct symlink_entry *next;
+	} *symlinks = NULL, *last = NULL;
 
 #ifdef DEBUG
 	printf("==> tar_extract_all(TAR *t, \"%s\")\n",
 	       (prefix ? prefix : "(null)"));
 #endif
 
-	while ((i = th_read(t)) == 0)
-	{
-#ifdef DEBUG
-		puts("    tar_extract_all(): calling th_get_pathname()");
-#endif
+	// 第一遍：只解包普通文件和目录，收集软链接
+	while ((i = th_read(t)) == 0) {
 		filename = th_get_pathname(t);
-		if (t->options & TAR_VERBOSE)
-			th_print_long_ls(t, stderr);
 		if (prefix != NULL)
 			snprintf(buf, sizeof(buf), "%s/%s", prefix, filename);
 		else
 			strlcpy(buf, filename, sizeof(buf));
-#ifdef DEBUG
-		printf("    tar_extract_all(): calling tar_extract_file(t, "
-		       "\"%s\")\n", buf);
-#endif
-		if (tar_extract_file(t, buf) != 0)
-			return -1;
+
+		if (TH_ISSYM(t)) {
+			// 收集软链接信息
+			struct symlink_entry *entry = malloc(sizeof(struct symlink_entry));
+			if (!entry) {
+				errno = ENOMEM;
+				return -1;
+			}
+			const char *target = th_get_linkname(t);
+			if (prefix != NULL)
+				snprintf(src_path, sizeof(src_path), "%s/%s", prefix, target);
+			else
+				strlcpy(src_path, target, sizeof(src_path));
+			strncpy(entry->target, src_path, MAXPATHLEN-1);
+			strncpy(entry->linkname, buf, MAXPATHLEN-1);
+			entry->target[MAXPATHLEN-1] = '\0';
+			entry->linkname[MAXPATHLEN-1] = '\0';
+			entry->mode = 0700;  // 强制设置为可执行权限
+			entry->next = NULL;
+			if (last) last->next = entry;
+			else symlinks = entry;
+			last = entry;
+		} else if (TH_ISREG(t) || TH_ISDIR(t)) {
+			if (tar_extract_file(t, buf) != 0) {
+				// 清理链表
+				struct symlink_entry *cur = symlinks;
+				while (cur) {
+					struct symlink_entry *next = cur->next;
+					free(cur);
+					cur = next;
+				}
+				return -1;
+			}
+		}
+	}
+
+	// 第二遍：处理软链接（用复制模式）
+	struct symlink_entry *cur = symlinks;
+	while (cur) {
+		printf("[symlink->copy] copy %s to %s (mode: 0%o)\n", 
+               cur->target, cur->linkname, cur->mode);
+		
+		FILE *src_fp = fopen(cur->target, "rb");
+		if (!src_fp) {
+			perror("fopen(src)");
+			printf("Failed to open source file: %s\n", cur->target);
+			struct symlink_entry *tmp = cur;
+			cur = cur->next;
+			free(tmp);
+			continue;
+		}
+		FILE *dst_fp = fopen(cur->linkname, "wb");
+		if (!dst_fp) {
+			perror("fopen(dst)");
+			printf("Failed to open destination file: %s\n", cur->linkname);
+			fclose(src_fp);
+			struct symlink_entry *tmp = cur;
+			cur = cur->next;
+			free(tmp);
+			continue;
+		}
+		
+		char buf2[4096];
+		size_t n;
+		while ((n = fread(buf2, 1, sizeof(buf2), src_fp)) > 0) {
+			if (fwrite(buf2, 1, n, dst_fp) != n) {
+				perror("fwrite");
+				printf("Failed to write to destination file: %s\n", cur->linkname);
+				fclose(src_fp);
+				fclose(dst_fp);
+				struct symlink_entry *tmp = cur;
+				cur = cur->next;
+				free(tmp);
+				continue;
+			}
+		}
+		fclose(src_fp);
+		fclose(dst_fp);
+		
+		// 设置文件权限并检查结果
+		if (chmod(cur->linkname, cur->mode) == -1) {
+			perror("chmod");
+			printf("Failed to set permissions (0%o) for: %s\n", 
+                   cur->mode, cur->linkname);
+		} else {
+			printf("[chmod] Set permissions 0%o for %s\n", 
+                   cur->mode, cur->linkname);
+		}
+		
+		// 验证权限
+		struct stat st;
+		if (stat(cur->linkname, &st) == 0) {
+			printf("[verify] File %s has mode: 0%o\n", 
+                   cur->linkname, st.st_mode & 0777);
+		} else {
+			perror("stat");
+		}
+		
+		struct symlink_entry *tmp = cur;
+		cur = cur->next;
+		free(tmp);
 	}
 
 	return (i == 1 ? 0 : -1);

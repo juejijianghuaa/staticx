@@ -72,7 +72,7 @@ def get_version():
     return importlib_metadata.version(DIST_SPEC)
 
 
-__version__ = get_version()
+__version__ = BASE_VERSION
 
 if __name__ == '__main__':
     print(__version__)

@@ -55,9 +55,12 @@ tar_extract_file(TAR *t, const char *realname)
 	int pathname_len;
 	int realname_len;
 
+	printf("Debug: entering tar_extract_file for %s\n", realname);
+
 	if (t->options & TAR_NOOVERWRITE)
 	{
 		struct stat s;
+		printf("Debug: checking TAR_NOOVERWRITE\n");
 
 		if (lstat(realname, &s) == 0 || errno != ENOENT)
 		{
@@ -66,24 +69,44 @@ tar_extract_file(TAR *t, const char *realname)
 		}
 	}
 
+	printf("Debug: checking file type\n");
 	if (TH_ISDIR(t))
 	{
+		printf("Debug: is directory\n");
 		i = tar_extract_dir(t, realname);
 		if (i == 1)
 			i = 0;
 	}
 	else if (TH_ISLNK(t))
+	{
+		printf("Debug: is hardlink\n");
 		i = tar_extract_hardlink(t, realname);
+	}
 	else if (TH_ISSYM(t))
+	{
+		printf("Debug: is symlink\n");
 		i = tar_extract_symlink(t, realname);
+	}
 	else if (TH_ISCHR(t))
+	{
+		printf("Debug: is chardev\n");
 		i = tar_extract_chardev(t, realname);
+	}
 	else if (TH_ISBLK(t))
+	{
+		printf("Debug: is blockdev\n");
 		i = tar_extract_blockdev(t, realname);
+	}
 	else if (TH_ISFIFO(t))
+	{
+		printf("Debug: is fifo\n");
 		i = tar_extract_fifo(t, realname);
+	}
 	else /* if (TH_ISREG(t)) */
+	{
+		printf("Debug: is regular file\n");
 		i = tar_extract_regfile(t, realname);
+	}
 
 	if (i != 0)
 		return i;
@@ -128,95 +151,57 @@ tar_extract_regfile(TAR *t, const char *realname)
 	ssize_t n;
 	int retval = -1;
 
-#ifdef DEBUG
-	printf("==> tar_extract_regfile(t=0x%p, realname=\"%s\")\n", t,
-	       realname);
-#endif
-
-	if (!TH_ISREG(t))
-	{
-		errno = EINVAL;
-		goto out;
-	}
-
+	// 最小化系统调用和错误检查
 	filename = (realname ? realname : th_get_pathname(t));
 	mode = th_get_mode(t);
 	size = th_get_size(t);
 
-	if (mkdirs_for(filename) == -1)
-		goto out;
-
-#ifdef DEBUG
-	printf("  ==> extracting: %s (mode %04o, %zd bytes)\n",
-	       filename, mode, size);
-#endif
-	fdout = open(filename, O_WRONLY | O_CREAT | O_TRUNC
-#ifdef O_BINARY
-		     | O_BINARY
-#endif
-		    , 0666);
-	if (fdout == -1)
-	{
-#ifdef DEBUG
-		perror("open()");
-#endif
-		goto out;
+	// 先直接试图创建文件
+	fdout = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0666);
+	if (fdout == -1 && errno == ENOENT) {
+		// 只有在文件创建失败时才尝试创建目录
+		if (mkdirs_for(filename) == -1 || 
+		    (fdout = open(filename, O_WRONLY | O_CREAT | O_TRUNC, 0666)) == -1)
+			goto out;
 	}
 
-	/* NOTE: We do not change owner, as that would require root */
-
-	if (fchmod(fdout, mode & 07777) == -1)
-	{
-#ifdef DEBUG
-		perror("fchmod()");
-#endif
-		goto out;
-	}
-
-	/* extract the file */
-
-	/* Must always read a multiple of T_BLOCKSIZE bytes */
+	// 分配内存并读取数据
 	to_read = align_up(size, T_BLOCKSIZE);
-
 	buf = malloc(to_read);
 	if (!buf) {
 		errno = ENOMEM;
 		goto out;
 	}
 
-	/* Read blocks */
+	// 读取数据
 	n = t->type->readfunc(t->context, buf, to_read);
 	if (n != to_read) {
-# ifdef DEBUG
-		fprintf(stderr, "libtar readfunc(%zu) returned %zd\n", to_read, n);
-# endif
 		errno = EINVAL;
 		goto out;
 	}
 
-	/* Write blocks to file */
+	// 写入数据
 	n = write(fdout, buf, size);
 	if (n != size) {
-# ifdef DEBUG
-		fprintf(stderr, "libtar write(%zu) returned %zd\n", size, n);
-# endif
 		errno = EINVAL;
 		goto out;
 	}
 
-	/* Success */
+	// 设置权限
+	if (fchmod(fdout, mode & 07777) == -1) {
+		// 如果 fchmod 失败，尝试 chmod
+		close(fdout);
+		fdout = -1;
+		if (chmod(filename, mode & 07777) == -1)
+			goto out;
+	}
+
 	retval = 0;
-#ifdef DEBUG
-	printf("### done extracting %s\n", filename);
-#endif
 
 out:
 	free(buf);
-	buf = NULL;
-
 	if (fdout != -1)
 		close(fdout);
-
 	return retval;
 }
 

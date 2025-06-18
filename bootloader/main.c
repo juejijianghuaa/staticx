@@ -19,7 +19,6 @@
 #include "debug.h"
 #include "extract.h"
 #include "elfutil.h"
-#include <sys/stat.h>
 
 /**
  * Environment variables which affect the bootloader's execution
@@ -330,49 +329,14 @@ run_app(int argc, char **argv, char *prog_path)
     if (child_pid < 0)
         error(2, errno, "Failed to fork child process");
 
+
     if (child_pid == 0) {
         /*** Child ***/
-        debug_printf("Child process started; ready to execute program\n");
-        debug_printf("Program path: %s\n", new_argv[0]);
-        
-        // 检查文件权限和存在性
-        struct stat st;
-        if (stat(new_argv[0], &st) == -1) {
-            printf(stderr, "Cannot stat %s: %s\n", new_argv[0], strerror(errno));
-            _exit(4);
-        }
-        
-        // 确保有执行权限
-        if (!(st.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH))) {
-            if (chmod(new_argv[0], st.st_mode | S_IXUSR) == -1) {
-                printf(stderr, "Cannot chmod %s: %s\n", new_argv[0], strerror(errno));
-                _exit(5);
-            }
-        }
-        
-        // 准备环境变量
-        char *const envp[] = {
-            "PATH=/system/bin:/system/xbin",
-            NULL
-        };
-        
-#ifdef __ANDROID__
-        // Android 上尝试不同的执行方法
-        debug_printf("Trying execve on Android\n");
-        execve(new_argv[0], new_argv, envp);
-        
-        // 如果 execve 失败，尝试用 /system/bin/sh 执行
-        debug_printf("Trying to execute via shell\n");
-        char *sh_argv[] = {"/system/bin/sh", "-c", new_argv[0], NULL};
-        execv("/system/bin/sh", sh_argv);
-#else
-        execve(new_argv[0], new_argv, envp);
-#endif
+        debug_printf("Child process started; ready to call execv()\n");
 
-        // 如果执行到这里，说明所有尝试都失败了
-        int saved_errno = errno;
-        printf(stderr, "Failed to execute %s: %s (errno=%d)\n", 
-                new_argv[0], strerror(saved_errno), saved_errno);
+        execv(new_argv[0], new_argv);
+
+        fprintf(stderr, "Failed to execv() %s: %m\n", new_argv[0]);
         _exit(3);
     }
 
@@ -453,14 +417,6 @@ static void identify(void)
     /* If we're invoked by staticx, just exit */
     if (getenv("STATICX_BOOTLOADER_IDENTIFY"))
         exit(0);
-}
-
-static mode_t get_file_mode(const char *path) {
-    struct stat st;
-    if (stat(path, &st) == 0) {
-        return st.st_mode & 0777;
-    }
-    return 0;
 }
 
 int
